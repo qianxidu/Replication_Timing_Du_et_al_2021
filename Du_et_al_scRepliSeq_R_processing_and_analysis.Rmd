@@ -1,0 +1,1020 @@
+---
+title: "scRepli-Seq analysis"
+author: Qian Du
+---
+
+# Libraries
+```{r}
+library(GenomicRanges)
+library(rtracklayer)
+library(reshape2)
+library(data.table)
+library(BSgenome.Hsapiens.UCSC.hg19)
+library(dplyr)
+library(reshape)
+library(AneuFinder)
+library(Rtsne)
+library(gplots)
+```
+
+# For bam processing see 'scRepli-Seq_bam_processing.sh'
+
+# Step 1: Calculating MAD scores
+```{r}
+# example shown for HCT116 G1, repeated for all samples
+
+# Step 1a: Making pooled mappability bed file from 10X outputs to filter for unmappable regions in latter steps (Aneufinder) ----
+
+bl1 <- import("/outputs_10X_scCNV_pipeline/hg19/HCT-G1/mappable_regions.bed")
+bl2 <- import("/outputs_10X_scCNV_pipeline/hg19/HCT-S/mappable_regions.bed")
+bl3 <- import("/outputs_10X_scCNV_pipeline/hg19/DKO-G1/mappable_regions.bed")
+bl4 <- import("/outputs_10X_scCNV_pipeline/hg19/DKO-S/mappable_regions.bed")
+
+bl1.g <- gaps(bl1)
+bl2.g <- gaps(bl2)
+bl3.g <- gaps(bl3)
+bl4.g <- gaps(bl4)
+
+bl.g <- reduce(c(bl1.g, bl2.g, bl3.g, bl4.g))
+
+export(bl.g, "mappability_gaps_scCNV_10X.bed")
+
+# Step 1b: Counting reads in 200kb bins ----
+
+outpath <- ".../AneuFinder/findCNVs/hctG1_binned_200k/"
+inpath <- ".../sc_bams_hct_G1_filt/"
+
+unmappable <- import("mappability_gaps_scCNV_10X.bed")
+
+bamfiles <- grep(".asd.bam$", list.files(paste0(inpath), full.names=T), value=T)
+names(bamfiles) <- gsub(".asd.bam", "", basename(bamfiles))
+
+for (i in names(bamfiles)) {
+	binReads(bamfiles[i], assembly='hg19', ID = i, binsize=200000, chromosomes=c(1:22), pairedEndReads = TRUE, save.as.RData = TRUE, outputfolder.binned=paste0(outpath), min.mapq=NA, blacklist = unmappable)
+	cat(i)
+}
+
+countfiles <- list.files(outpath, full.names=T)
+names(countfiles) <- gsub("_binsize.*", "", basename(countfiles))
+
+load(countfiles[1])
+count.bins <- as.data.frame(bins)
+count.bins <- count.bins[,1:3]
+for (i in names(countfiles)) {
+  load(countfiles[i])
+  count.bins[,i] <- bins$counts
+  cat(i)
+}
+
+write.table(count.bins, paste0(outpath, "hctG1_AneuFinder_counts_200kb.txt"), sep="\t", quote=F, row.names=F)
+
+# Step 1c: Calculating MAD scores and filtering cells ----
+
+hctG1.fc <- as.data.frame(fread("hctG1_AneuFinder_counts_200kb.txt", stringsAsFactors = F))
+hctG1.fc.tmp <- hctG1.fc[,c(4:ncol(hctG1.fc))]
+
+# MAD score calculation from Takahashi et al. (2019)
+mad.hctg1 <- c()
+for (i in colnames(hctG1.fc.tmp)) {
+ dat <- hctG1.fc.tmp[,i]
+ dat <- dat[which(dat != 0)]
+ mad.hctg1[i] <- mad(log2(dat/median(dat)))
+ cat(i)
+}
+
+df <- as.data.frame(mad.hctg1)
+df$cell <- rownames(df)
+
+write.table(df, "mad_hct_G1.txt", sep="\t", quote=F, row.names=F) 
+
+```
+
+# Step 2: Filtering G1 cells and making merged G1 bam file
+```{r}
+# example shown for HCT116
+
+# Step 2a: Counting reads in 500kb bins and calculating QC metrics for G1 cells ----
+
+outpath <- ".../hctG1_500kb/"
+inpath <- ".../sc_bams_hct_G1_filt/"
+
+unmappable <- import("mappability_gaps_scCNV_10X.bed")
+
+bamfiles <- grep(".asd.bam$", list.files(paste0(inpath), full.names=T), value=T)
+names(bamfiles) <- gsub(".asd.bam", "", basename(bamfiles))
+
+for (i in names(bamfiles)) {
+	binReads(bamfiles[i], assembly='hg19', ID = i, binsize=500000, chromosomes=c(1:22), pairedEndReads = TRUE, save.as.RData = TRUE, outputfolder.binned=paste0(outpath, "binned"), min.mapq=NA, blacklist = unmappable)
+	load(grep(i, list.files(paste0(outpath, "binned"), full.names=T), value=T))
+	model <- findCNVs(bins, method="HMM", max.iter=3000, states=c("zero-inflation","0-somy","1-somy","2-somy","3-somy","4-somy","5-somy","6-somy"), eps=0.01)
+	save(model, file=paste0(outpath, "models/", i, "_findCNVs_model.RData"))
+	cat(i)
+}
+
+binfiles <- list.files(paste0(outpath, "binned"), full.names=T)
+names(binfiles) <- gsub("_binsize.*", "", basename(binfiles))
+
+bins.GC <- correctGC(binfiles, GC.BSgenome=BSgenome.Hsapiens.UCSC.hg19, same.binsize = TRUE) 
+
+for (i in names(bins.GC)) {
+	model <- findCNVs(bins.GC[i], method="HMM", max.iter=3000, states=c("zero-inflation","0-somy","1-somy","2-somy","3-somy","4-somy","5-somy","6-somy"), eps=0.01)
+	save(model, file=paste0(outpath, "modelsGC/", gsub("_binsize.*", "", basename(i)), "_findCNVs_model.RData"))
+	cat(i)
+}
+
+modelfiles <- grep("RData", list.files(paste0("./hctG1_500kb/models/"), full.names=T), value=T)
+names(modelfiles) <- gsub("_findCNV.*", "", basename(modelfiles))
+
+cl <- clusterByQuality(modelfiles, measures=c('spikiness','bhattacharyya'))
+
+df <- as.data.frame(cl$Mclust$data)
+df$cell <- gsub("_findCNVs_model.RData", "", basename(rownames(df)))
+write.table(df, "clustQual_hctG1_500kb.txt", sep="\t", quote=F, row.names=F) 
+
+modelfiles <- grep("RData", list.files(paste0("./hctG1_mapGC/modelsGC/"), full.names=T), value=T)
+names(modelfiles) <- gsub("_findCNV.*", "", basename(modelfiles))
+
+cl <- clusterByQuality(modelfiles, measures=c('spikiness','bhattacharyya'))
+
+df <- as.data.frame(cl$Mclust$data)
+df$cell <- gsub("_findCNVs_model.RData", "", basename(rownames(df)))
+write.table(df, "clustQual_hctG1_500kb_postGC.txt", sep="\t", quote=F, row.names=F) 
+
+# Step 2b: Final list of G1 cell indexes to create merged G1 reference bam file ----
+# after filtering for MAD scores, ‘spikiness’ and ‘bhattacharyya’ quality scores and cells removed if deemed ‘noisy’ by Cell Ranger DNA
+# see 'scRepli-Seq_bam_processing.sh' for G1 cell bam merging
+
+df <- as.data.frame(fread("summary_metrics_QC_hctG1.csv", stringsAsFactors = F))
+tmp <- df[which(df$REMOVE==0),]
+tmp$barcode <- gsub("-1", "", tmp$barcode)
+tmp <- tmp[,1]
+write.table(tmp, "idx_merge_hctG1.txt", sep="\t", quote=F, row.names=F, col.names=F)
+
+# Step 2c: Defining heterogeneous regions in G1 population ----
+
+modelfiles <- grep("RData", list.files(paste0("./hctG1_500kb/models/"), full.names=T), value=T)
+names(modelfiles) <- gsub("_find.*", "", basename(modelfiles))
+idx <- read.table("idx_merge_hctG1.txt")
+idx$name <- paste0("hct_G1_", idx$V1)
+modelfiles2 <- modelfiles[names(modelfiles) %in% idx$name]
+length(modelfiles2)
+
+normal.chrom.numbers <- rep(2, 22)
+names(normal.chrom.numbers) <- c(1:22)
+
+# edited karyotypeMeasures function from AneuFinder to get heterogeneity score per bin
+karyotypeMeasures <- function(hmms, normalChromosomeNumbers=NULL, regions=NULL, exclude.regions=NULL) {
+
+    ## Check user input
+    if (is.matrix(normalChromosomeNumbers)) {
+        if (nrow(normalChromosomeNumbers) != length(hmms)) {
+            stop("nrow(normalChromosomeNumbers) must be equal to length(hmms)")
+        }
+    }
+    ## Load the files
+    hmms <- loadFromFiles(hmms, check.class=c("aneuHMM", "aneuBiHMM"))
+  
+    ## If all binsizes are the same the consensus template can be chosen equal to the bins
+    #ptm <- startTimedMessage("Making consensus template ...")
+    binsizes <- unlist(lapply(hmms, function(x) { width(x$bins)[1] }))
+    # Filter out HMMs where segments of bins$state are NULL
+    mask <- !sapply(hmms, function(hmm) { is.null(hmm$segments) | is.null(hmm$bins$state) })
+    hmms <- hmms[mask]
+    if (all(binsizes==binsizes[1])) {
+        consensus <- hmms[[1]]$bins #just bins
+        mcols(consensus) <- NULL
+        constates <- array(NA, dim=c(length(consensus), length(hmms)), dimnames=list(chromosome=as.vector(seqnames(consensus)), sample=sapply(hmms, '[[', 'ID'))) #copy.num per bin as matrix
+        for (i1 in 1:length(hmms)) {
+            hmm <- hmms[[i1]]
+            constates[,i1] <- hmm$bins$copy.number
+        }
+    } else { # binsizes differ
+        consensus <- consensusSegments(hmms)
+        constates <- consensus$copy.number
+    }
+    #stopTimedMessage(ptm)
+  
+    ### Exclude regions ###
+    if (!is.null(exclude.regions)) {
+        ind <- findOverlaps(consensus, exclude.regions)@from
+    		constates <- constates[-ind,]
+    		consensus <- consensus[-ind]
+    }
+
+    ### Karyotype measures ###
+    #ptm <- startTimedMessage("Karyotype measures ...")
+    result <- list()
+    S <- ncol(constates)
+    ## Genomewide
+    physioState <- array(2, dim=dim(constates), dimnames=list(chromosome=rownames(constates), sample=NULL)) #all states for all bin is 2
+    if (!is.null(normalChromosomeNumbers)) {
+        if (is.vector(normalChromosomeNumbers)) {
+            mask <- rownames(physioState) %in% names(normalChromosomeNumbers)
+            physioState[mask,] <- normalChromosomeNumbers[rownames(physioState)[mask]]
+        } else if (is.matrix(normalChromosomeNumbers)) {
+            mask <- rownames(physioState) %in% colnames(normalChromosomeNumbers)
+            physioState[mask, ] <- t(normalChromosomeNumbers[, rownames(physioState)[mask]])
+        }
+    }
+    consensus$Aneuploidy <- rowMeans(abs(constates - physioState))
+    tabs <- apply(constates - physioState, 1, function(x) { sort(table(x), decreasing=TRUE) }) # Heterogeneity score in reference to the physiological state
+#     tabs <- apply(constates, 1, function(x) { sort(table(x), decreasing=TRUE) })
+    if (is.list(tabs) | is.vector(tabs)) {
+        consensus$Heterogeneity <- unlist(lapply(tabs, function(x) { sum(x * 0:(length(x)-1)) })) / S
+        #x <- tabs[[34]]
+    } else if (is.matrix(tabs)) {
+        consensus$Heterogeneity <- colSums( tabs * 0:(nrow(tabs)-1) ) / S
+    }
+    weights <- as.numeric(width(consensus))
+    result[['genomewide']] <- data.frame(Aneuploidy = stats::weighted.mean(consensus$Aneuploidy, weights),
+                                        Heterogeneity = stats::weighted.mean(consensus$Heterogeneity, weights))
+    ## Chromosomes
+    consensus.split <- split(consensus, seqnames(consensus))
+    weights.split <- split(weights, seqnames(consensus))
+    result[['per.chromosome']] <- data.frame(Aneuploidy = unlist(mapply(function(x,y) { stats::weighted.mean(x$Aneuploidy, y) }, consensus.split, weights.split)),
+                                              Heterogeneity = unlist(mapply(function(x,y) { stats::weighted.mean(x$Heterogeneity, y) }, consensus.split, weights.split)))
+    
+    ## Region
+    if (!is.null(regions)) {
+        regions <- subsetByOverlaps(regions, consensus)
+        # Find split vector
+        ind <- findOverlaps(consensus, regions, select='first')
+        consensus.split <- split(consensus, ind)
+        weights.split <- split(weights, ind)
+        regions$Aneuploidy <- unlist(mapply(function(x,y) { stats::weighted.mean(x$Aneuploidy, y) }, consensus.split, weights.split))
+        regions$Heterogeneity <- unlist(mapply(function(x,y) { stats::weighted.mean(x$Heterogeneity, y) }, consensus.split, weights.split))
+        result[['regions']] <- regions
+    }
+    #stopTimedMessage(ptm)
+    
+    #return(result)
+    return(consensus) ## edited
+
+}
+
+het <- karyotypeMeasures(modelfiles2, normalChromosomeNumbers = normal.chrom.numbers) 
+het <- as.data.frame(het)
+write.table(het, paste0("hetScores_hctG1_500kb.txt"), sep="\t", quote=F, row.names=F)
+
+# calling regions of high heterogeneity from AneuFinder
+# het regions in either HCT116 or DKO1
+
+het.hct <- as.data.frame(fread("hetScores_hctG1_500kb.txt"))
+tmp <- GRanges(paste0("chr", het.af.hct$seqnames), IRanges(het.af.hct$start, het.af.hct$end), strand="*", score=het.af.hct$Heterogeneity)
+seqlevels(tmp, force=TRUE) <- seqlevels(Hsapiens)[1:22]
+seqlengths(tmp) <- seqlengths(Hsapiens)[1:22]
+
+het.dko <- as.data.frame(fread("hetScores_dkoG1_500kb.txt"))
+tmp <- GRanges(paste0("chr", het.af.dko$seqnames), IRanges(het.af.dko$start, het.af.dko$end), strand="*", score=het.af.dko$Heterogeneity)
+evels(tmp, force=TRUE) <- seqlevels(Hsapiens)[1:22]
+seqlengths(tmp) <- seqlengths(Hsapiens)[1:22]
+
+het.hct$Heterogeneity.dko <- het.dko$Heterogeneity
+het.0.2 <- het.hct[which(het.hct$Heterogeneity > 0.2 | het.hct$Heterogeneity.dko > 0.2),]
+
+tmp <- GRanges(paste0("chr", het.0.2$seqnames), IRanges(het.0.2$start, het.0.2$end), strand="*")
+seqlevels(tmp, force=TRUE) <- seqlevels(Hsapiens)[1:22]
+seqlengths(tmp) <- seqlengths(Hsapiens)[1:22]
+export(tmp, "hctdkoG1_het_AneuFinder.bed")
+
+# Step 2d: Creating master bed file of regions to be removed from downstream analysis ----
+# includes heterogeneous regions, SVs, and unmappable regions
+
+unmappable <- import("mappability_gaps_scCNV_10X.bed")
+seqlevels(unmappable) <- paste0("chr", seqlevels(unmap))
+seqlevels(unmappable, force=TRUE) <- seqlevels(Hsapiens)[1:22]
+seqlengths(unmappable) <- seqlengths(Hsapiens)[1:22]
+unmappable <- sort(unmappable)
+
+het <- import("hctdkoG1_het_AneuFinder.bed")
+
+SVs <- import("SV_nanoscCNVtog.bed")
+
+remove <- c(het, unmappable, SVs)
+remove <- reduce(remove)
+export(remove, "regions_to_remove.bed")
+```
+
+# Step 3: Preparing mappability corrected count tables
+```{r}
+# example shown for HCT116 S-phase, repeat for all samples
+
+# Step 3a: Counting reads in 200kb bins at 40kb intervals (200k40k) and in 80kb non-overlapping bins ----
+
+# 200k40k
+outpath <- "hctS_binned_200k40k/"
+inpath <- "sc_bams_hct_S_filt/"
+
+unmappable <- import("mappability_gaps_scCNV_10X.bed")
+
+bamfiles <- grep(".asd.bam$", list.files(paste0(inpath), full.names=T), value=T)
+names(bamfiles) <- gsub(".asd.bam", "", basename(bamfiles))
+
+for (i in names(bamfiles)) {
+	binReads(bamfiles[i], assembly='hg19', ID = i, binsize=200000, stepsize=40000, chromosomes=c(1:22), pairedEndReads = TRUE, save.as.RData = TRUE, outputfolder.binned=paste0(outpath), min.mapq=NA, blacklist = unmappable)
+	cat(i)
+}
+
+# 80k 
+
+outpath <- "hctS_binned_80k/"
+
+for (i in names(bamfiles)) {
+	binReads(bamfiles[i], assembly='hg19', ID = i, binsize=80000, chromosomes=c(1:22), pairedEndReads = TRUE, save.as.RData = TRUE, outputfolder.binned=paste0(outpath), min.mapq=NA, blacklist = unmappable)
+	cat(i)
+}
+
+# Step 3b: Making bed files of 200k40k bins and 80k bins without unwanted regions ----
+
+# export bin coordinates from binned files
+inpath <- "hctS_binned_200k40k/"
+binfiles <- grep(".RData", list.files(paste0(inpath), full.names=T), value=T)
+names(binfiles) <- gsub("_binsize.*", "", basename(binfiles))
+load(binfiles[[1]])
+
+tbl <- list()
+for (i in 1:length(bins)) {
+  tbl[[i]] <- as.data.frame(bins[[i]], stringsAsFactors=F)
+}
+
+save(tbl, file="bins_200k40k.RData", version=2)
+
+inpath <- "hctS_binned_80k/"
+binfiles <- grep(".RData", list.files(paste0(inpath), full.names=T), value=T)
+names(binfiles) <- gsub("_binsize.*", "", basename(binfiles))
+load(binfiles[[1]])
+
+tbl <- as.data.frame(bins, stringsAsFactors=F)
+
+save(tbl, file="bins_80k.RData", version=2)
+
+# removing unwanted regions from 200k40k - have to do this separately for each set of sliding windows
+
+remove <- import("regions_to_remove.bed")
+load("bins_200k40k.RData")
+tbl
+
+tmp <- GRanges(paste0("chr",tbl[[1]]$seqnames), IRanges(tbl[[1]]$start, tbl[[1]]$end), strand="*")
+seqlevels(tmp, force=TRUE) <- seqlevels(Hsapiens)[1:22]
+seqlengths(tmp) <- seqlengths(Hsapiens)[1:22]
+tmp <- tmp[!tmp %over% remove]
+seqlevels(tmp) <- gsub("chr", "", seqlevels(tmp))
+export(tmp, "bins_200k40k_win1.bed")
+
+tmp <- GRanges(paste0("chr",tbl[[2]]$seqnames), IRanges(tbl[[2]]$start, tbl[[2]]$end), strand="*")
+seqlevels(tmp, force=TRUE) <- seqlevels(Hsapiens)[1:22]
+seqlengths(tmp) <- seqlengths(Hsapiens)[1:22]
+tmp <- tmp[!tmp %over% remove]
+seqlevels(tmp) <- gsub("chr", "", seqlevels(tmp))
+export(tmp, "bins_200k40k_win2.bed")
+
+tmp <- GRanges(paste0("chr",tbl[[3]]$seqnames), IRanges(tbl[[3]]$start, tbl[[3]]$end), strand="*")
+seqlevels(tmp, force=TRUE) <- seqlevels(Hsapiens)[1:22]
+seqlengths(tmp) <- seqlengths(Hsapiens)[1:22]
+tmp <- tmp[!tmp %over% remove]
+seqlevels(tmp) <- gsub("chr", "", seqlevels(tmp))
+export(tmp, "bins_200k40k_win3.bed")
+
+tmp <- GRanges(paste0("chr",tbl[[4]]$seqnames), IRanges(tbl[[4]]$start, tbl[[4]]$end), strand="*")
+seqlevels(tmp, force=TRUE) <- seqlevels(Hsapiens)[1:22]
+seqlengths(tmp) <- seqlengths(Hsapiens)[1:22]
+tmp <- tmp[!tmp %over% remove]
+seqlevels(tmp) <- gsub("chr", "", seqlevels(tmp))
+export(tmp, "bins_200k40k_win4.bed")
+
+tmp <- GRanges(paste0("chr",tbl[[5]]$seqnames), IRanges(tbl[[5]]$start, tbl[[5]]$end), strand="*")
+seqlevels(tmp, force=TRUE) <- seqlevels(Hsapiens)[1:22]
+seqlengths(tmp) <- seqlengths(Hsapiens)[1:22]
+tmp <- tmp[!tmp %over% remove]
+seqlevels(tmp) <- gsub("chr", "", seqlevels(tmp))
+export(tmp, "bins_200k40k_win5.bed")
+
+# removing unwanted regions from 80k bins
+
+remove <- import("regions_to_remove.bed")
+load("bins_80k.RData")
+tbl
+tmp <- GRanges(paste0("chr",tbl[[5]]$seqnames), IRanges(tbl[[5]]$start, tbl[[5]]$end), strand="*")
+seqlevels(tmp, force=TRUE) <- seqlevels(Hsapiens)[1:22]
+seqlengths(tmp) <- seqlengths(Hsapiens)[1:22]
+tmp <- tmp[!tmp %over% remove]
+seqlevels(tmp) <- gsub("chr", "", seqlevels(tmp))
+export(tmp, "bins_80k.bed")
+
+# Step 3c: Obtaining read counts of pooled G1 cells for mappability correction ----
+
+# edited correctMappability function from Aneufinder v1.5.0 (see correctionMethods.R) to allow for removed bins
+correctMappability <- function(binned.data.list, same.binsize, reference, refbinfile=NULL, assembly, pairedEndReads=FALSE, min.mapq=10, remove.duplicate.reads=TRUE, max.fragment.width=1000, win.name=NULL, blacklist=NULL, keep.regions.path=NULL) {
+
+  binned.data.list <- loadFromFiles(binned.data.list, check.class='GRanges')
+  same.binsize.calculated <- FALSE
+  for (i1 in 1:length(binned.data.list)) {
+
+    if (is.null(keep.regions.path)) { #remove regions that are not to be included
+      binned.data <- binned.data.list[[i1]]
+    } else {
+      binned.data <- binned.data.list[[i1]]
+      keep.regions <- import(keep.regions.path)
+      binned.data <- subsetByOverlaps(binned.data, keep.regions)
+    }
+
+    ## Calculate GC content per bin
+    if (same.binsize & !same.binsize.calculated | !same.binsize) {
+      if (!is.null(refbinfile) & is.null(keep.regions.path)) {
+        load(refbinfile)
+      } else if (!is.null(refbinfile) & !is.null(keep.regions.path)) {
+        load(refbinfile)
+        refbin <- subsetByOverlaps(refbin, keep.regions) #also remove regions that are not to be included from the reference bin file
+      } else {
+        refbin <- binReads(file=reference, assembly=assembly, chromosomes=seqlevels(binned.data), pairedEndReads=pairedEndReads, min.mapq=min.mapq, remove.duplicate.reads=remove.duplicate.reads, max.fragment.width=max.fragment.width, binsizes=NULL, reads.per.bin=NULL, bins=list('ref'=binned.data), save.as.RData=FALSE, calc.complexity=FALSE, blacklist=blacklist)[[1]]
+        if (!is.null(win.name)) { save(refbin, file=paste0(outpath, win.name, "_refbin.RData"), version=2) } #save the calculated reference mappability scores
+      }
+      ## Check if seqlengths of data and mappability correction are consistent
+      chromlengths <- seqlengths(binned.data)
+      chroms <- names(chromlengths)
+      # Compare
+      compare <- chromlengths[chroms] == seqlengths(refbin)[chroms]
+      if (any(compare==FALSE, na.rm=TRUE)) {
+        warning(paste0(attr(binned.data,'ID'),": Chromosome lengths differ between binned data and 'reference'. Mappability correction skipped. Please use the correct genome for option 'reference'."))
+        binned.data.list[[i1]] <- binned.data
+        next
+      }
+      
+      ## Make the mappability correction vector
+      tab <- table(refbin$counts)
+      refbin.maxcount <- as.numeric(names(which.max(tab[as.numeric(names(tab))>0])))
+      mappability <- refbin$counts / refbin.maxcount
+      mappability[mappability==0] <- 1
+
+
+      same.binsize.calculated <- TRUE
+    }
+    binned.data$mappability <- mappability
+
+    ### GC correction ###
+    counts <- binned.data$counts / binned.data$mappability
+    mcounts <- binned.data$mcounts / binned.data$mappability
+    pcounts <- binned.data$pcounts / binned.data$mappability
+    ## Correction factors
+    binned.data$counts <- as.integer(round(counts))
+    binned.data$mcounts <- as.integer(round(mcounts))
+    binned.data$pcounts <- as.integer(round(pcounts))
+    binned.data$counts[binned.data$counts<0] <- 0
+    binned.data$pcounts[binned.data$pcounts<0] <- 0
+    binned.data$mcounts[binned.data$mcounts<0] <- 0
+
+    binned.data.list[[i1]] <- binned.data
+  }
+  return(binned.data.list)
+}
+
+# 200k40k
+outpath <- "hctG1_mapadj_200k40k/"
+inpath <- "hctS_binned_200k40k/"
+
+ref.path <- ".../sc_bams_hct_G1_filt/pooled_hct_G1.asd.bam"
+unmappable <- import("mappability_gaps_scCNV_10X.bed")
+
+binfiles <- grep(".RData", list.files(paste0(inpath), full.names=T), value=T)
+names(binfiles) <- gsub("_binsize.*", "", basename(binfiles))
+
+load(binfiles[[1]]) # using one cell to generate counts for reference pooled G1 bam file. Counts are loaded into function when actually adjusting mappability correction (see below) to allow for faster processing. Counting takes the longest time. 
+
+# did this 5 times to get the 5 sliding window sets in the 200k40k arrangement
+map.win1 <- correctMappability(bins[[1]], same.binsize = TRUE, reference = ref.path, assembly = 'hg19', pairedEndReads=TRUE, min.mapq=NA, win.name="correctMap_200k40k_hct_win1", blacklist = unmappable, outpath=outpath)
+
+map.win2 <- correctMappability(bins[[2]], same.binsize = TRUE, reference = ref.path, assembly = 'hg19', pairedEndReads=TRUE, min.mapq=NA, win.name="correctMap_200k40k_hct_win2", blacklist = unmappable, outpath=outpath)
+
+map.win3 <- correctMappability(bins[[3]], same.binsize = TRUE, reference = ref.path, assembly = 'hg19', pairedEndReads=TRUE, min.mapq=NA, win.name="correctMap_200k40k_hct_win3", blacklist = unmappable, outpath=outpath)
+
+map.win4 <- correctMappability(bins[[4]], same.binsize = TRUE, reference = ref.path, assembly = 'hg19', pairedEndReads=TRUE, min.mapq=NA, win.name="correctMap_200k40k_hct_win4", blacklist = unmappable, outpath=outpath)
+
+map.win5 <- correctMappability(bins[[5]], same.binsize = TRUE, reference = ref.path, assembly = 'hg19', pairedEndReads=TRUE, min.mapq=NA, win.name="correctMap_200k40k_hct_win5", blacklist = unmappable, outpath=outpath)
+
+# 80k
+outpath <- "hctG1_mapadj_80k/"
+inpath <- "hctS_binned_80k/"
+
+ref.path <- ".../sc_bams_hct_G1_filt/pooled_hct_G1.asd.bam"
+unmappable <- import("mappability_gaps_scCNV_10X.bed")
+
+binfiles <- grep(".RData", list.files(paste0(inpath), full.names=T), value=T)
+names(binfiles) <- gsub("_binsize.*", "", basename(binfiles))
+
+load(binfiles[[1]])
+
+map.win1 <- correctMappability(bins, same.binsize = TRUE, reference = ref.path, assembly = 'hg19', pairedEndReads=TRUE, min.mapq=NA, win.name="correctMap_80k_hct", outpath=outpath)
+
+# Step 3d: Mappability correction ----
+
+# edited correctMappability function from Aneufinder v1.5.0 (see correctionMethods.R) to allow for removed bins
+correctMappability <- function(binned.data.list, same.binsize, reference, refbinfile=NULL, assembly, pairedEndReads=FALSE, min.mapq=10, remove.duplicate.reads=TRUE, max.fragment.width=1000, win.name=NULL, blacklist=NULL, keep.regions.path=NULL) {
+
+  binned.data.list <- loadFromFiles(binned.data.list, check.class='GRanges')
+  same.binsize.calculated <- FALSE
+  for (i1 in 1:length(binned.data.list)) {
+
+    if (is.null(keep.regions.path)) { #remove regions that are not to be included
+      binned.data <- binned.data.list[[i1]]
+    } else {
+      binned.data <- binned.data.list[[i1]]
+      keep.regions <- import(keep.regions.path)
+      binned.data <- subsetByOverlaps(binned.data, keep.regions)
+    }
+
+    ## Calculate GC content per bin
+    if (same.binsize & !same.binsize.calculated | !same.binsize) {
+      if (!is.null(refbinfile) & is.null(keep.regions.path)) {
+        load(refbinfile)
+      } else if (!is.null(refbinfile) & !is.null(keep.regions.path)) {
+        load(refbinfile)
+        refbin <- subsetByOverlaps(refbin, keep.regions) #also remove regions that are not to be included from the reference bin file
+      } else {
+        refbin <- binReads(file=reference, assembly=assembly, chromosomes=seqlevels(binned.data), pairedEndReads=pairedEndReads, min.mapq=min.mapq, remove.duplicate.reads=remove.duplicate.reads, max.fragment.width=max.fragment.width, binsizes=NULL, reads.per.bin=NULL, bins=list('ref'=binned.data), save.as.RData=FALSE, calc.complexity=FALSE, blacklist=blacklist)[[1]]
+        if (!is.null(win.name)) { save(refbin, file=paste0(outpath, win.name, "_refbin.RData"), version=2) } #save the calculated reference mappability scores
+      }
+      ## Check if seqlengths of data and mappability correction are consistent
+      chromlengths <- seqlengths(binned.data)
+      chroms <- names(chromlengths)
+      # Compare
+      compare <- chromlengths[chroms] == seqlengths(refbin)[chroms]
+      if (any(compare==FALSE, na.rm=TRUE)) {
+        warning(paste0(attr(binned.data,'ID'),": Chromosome lengths differ between binned data and 'reference'. Mappability correction skipped. Please use the correct genome for option 'reference'."))
+        binned.data.list[[i1]] <- binned.data
+        next
+      }
+      
+      ## Make the mappability correction vector
+      tab <- table(refbin$counts)
+      refbin.maxcount <- as.numeric(names(which.max(tab[as.numeric(names(tab))>0])))
+      mappability <- refbin$counts / refbin.maxcount
+      mappability[mappability==0] <- 1
+
+
+      same.binsize.calculated <- TRUE
+    }
+    binned.data$mappability <- mappability
+
+    ### GC correction ###
+    counts <- binned.data$counts / binned.data$mappability
+    mcounts <- binned.data$mcounts / binned.data$mappability
+    pcounts <- binned.data$pcounts / binned.data$mappability
+    ## Correction factors
+    binned.data$counts <- as.integer(round(counts))
+    binned.data$mcounts <- as.integer(round(mcounts))
+    binned.data$pcounts <- as.integer(round(pcounts))
+    binned.data$counts[binned.data$counts<0] <- 0
+    binned.data$pcounts[binned.data$pcounts<0] <- 0
+    binned.data$mcounts[binned.data$mcounts<0] <- 0
+
+    binned.data.list[[i1]] <- binned.data
+  }
+  return(binned.data.list)
+}
+
+## correcting mappability for 200k40k bins
+inpath <- "hctS_binned_200k40k/"
+
+ref.path <- ".../sc_bams_hct_G1_filt/pooled_hct_G1.asd.bam"
+refbinpath <- "hctG1_mapadj_200k40k/"
+keepregionsfolder <- ".../beds/"
+
+binfiles <- grep(".RData", list.files(paste0(inpath), full.names=T), value=T)
+names(binfiles) <- gsub("_binsize.*", "", basename(binfiles))
+
+binlist <- list()
+for (i in names(binfiles)) {
+  load(binfiles[[i]])
+  binlist[[i]] <- bins[[1]]
+}
+
+map.win1 <- correctMappability(binlist, same.binsize = TRUE, reference = ref.path, refbinfile=paste0(refbinpath, "correctMap_200k40k_hct_win1_refbin.RData"),  assembly = 'hg19', pairedEndReads=TRUE, min.mapq=NA, keep.regions.path=paste0(keepregionsfolder, "bins_200k40k_win1.bed"))
+
+binlist <- list()
+for (i in 1:length(binfiles)) {
+  load(binfiles[[i]])
+  binlist[[i]] <- bins[[2]]
+}
+
+map.win2 <- correctMappability(binlist, same.binsize = TRUE, reference = ref.path, refbinfile=paste0(refbinpath, "correctMap_200k40k_hct_win2_refbin.RData"), assembly = 'hg19', pairedEndReads=TRUE, min.mapq=NA, keep.regions.path=paste0(keepregionsfolder, "bins_200k40k_win2.bed"))
+
+binlist <- list()
+for (i in 1:length(binfiles)) {
+  load(binfiles[[i]])
+  binlist[[i]] <- bins[[3]]
+}
+
+map.win3 <- correctMappability(binlist, same.binsize = TRUE, reference = ref.path, refbinfile=paste0(refbinpath, "correctMap_200k40k_hct_win3_refbin.RData"), assembly = 'hg19', pairedEndReads=TRUE, min.mapq=NA, keep.regions.path=paste0(keepregionsfolder, "bins_200k40k_win3.bed"))
+
+binlist <- list()
+for (i in 1:length(binfiles)) {
+  load(binfiles[[i]])
+  binlist[[i]] <- bins[[4]]
+}
+
+map.win4 <- correctMappability(binlist, same.binsize = TRUE, reference = ref.path, refbinfile=paste0(refbinpath, "correctMap_200k40k_hct_win4_refbin.RData"), assembly = 'hg19', pairedEndReads=TRUE, min.mapq=NA, keep.regions.path=paste0(keepregionsfolder, "bins_200k40k_win4.bed"))
+
+binlist <- list()
+for (i in 1:length(binfiles)) {
+  load(binfiles[[i]])
+  binlist[[i]] <- bins[[5]]
+}
+
+map.win5 <- correctMappability(binlist, same.binsize = TRUE, reference = ref.path, refbinfile=paste0(refbinpath, "correctMap_200k40k_hct_win5_refbin.RData"), assembly = 'hg19', pairedEndReads=TRUE, min.mapq=NA, keep.regions.path=paste0(keepregionsfolder, "bins_200k40k_win5.bed"))
+
+# generate merged table for 200k40k corrected counts
+
+tbl <- as.data.frame(map.win1[[1]])
+tbl <- tbl[,c(1:3,9)]
+for (i in names(map.win1)) {
+  tbl[,i] <- map.win1[[i]]$counts
+  cat(i)
+}
+win1 <- tbl # repeat for all 5 sliding window sets
+
+win1$id <- paste0("chr", win1$seqnames, "_", win1$start)
+win2$id <- paste0("chr", win2$seqnames, "_", win2$start)
+win3$id <- paste0("chr", win3$seqnames, "_", win3$start)
+win4$id <- paste0("chr", win4$seqnames, "_", win4$start)
+win5$id <- paste0("chr", win5$seqnames, "_", win5$start)
+
+win <- rbind(win1, win2, win3, win4, win5)
+win.gr <- GRanges(paste0("chr",win$seqnames), IRanges(win$start, win$end), strand="*", win[,c(5:ncol(win))]) 
+seqlevels(win.gr, force=TRUE) <- seqlevels(Hsapiens)[1:22]
+seqlengths(win.gr) <- seqlengths(Hsapiens)[1:22]
+win.gr <- sort(win.gr)
+
+win <- as.data.frame(win.gr)
+
+write.table(win, "HCT116_200K40K_mergedCounts.txt", sep="\t", quote=F, row.names=F, col.names = TRUE)
+
+## 80k
+outpath <- "hctS_mapadj_80k/"
+inpath <- "hctS_binned_80k/"
+
+ref.path <- ".../sc_bams_hct_G1_filt/pooled_hct_G1.asd.bam"
+refbinpath <- "hctG1_mapadj_80k/"
+keepregionsfolder <- ".../beds/"
+
+binfiles <- grep(".RData", list.files(paste0(inpath), full.names=T), value=T)
+names(binfiles) <- gsub("_binsize.*", "", basename(binfiles))
+
+binlist <- list()
+for (i in names(binfiles)) {
+  load(binfiles[i])
+  binlist[[i]] <- bins
+}
+
+map.win <- correctMappability(binlist, same.binsize = TRUE, reference = ref.path, refbinfile=paste0(refbinpath, "correctMap_80k_hct_refbin.RData"), assembly = 'hg19', pairedEndReads=TRUE, min.mapq=NA, keep.regions.path=paste0(keepregionsfolder, "bins_80k.bed"))
+
+save(map.win, file=paste0(outpath, "HCT116_80k_mapCorrected.RData"))
+
+tbl1 <- as.data.frame(map.win[[1]])
+tbl1 <- tbl1[,c(1:3,9)]
+for (i in names(map.win)) {
+  tbl1[,i] <- map.win[[i]]$counts
+  cat(i)
+}
+
+write.table(tbl1, paste0(outpath, "HCT116_80K_mergedCounts.txt"), sep="\t", quote=F, row.names=F)
+```
+
+# Step 4: Generating single cell RT wavelet scores and filtering of S-phase cells
+```{r}
+# example shown for HCT116
+
+# Step 4a: Filter S-phase cells using MAD and depth cutoffs ----
+# keep cells with MAD between 0.4 and 0.8 and more than 1M reads per cell
+
+df <- as.data.frame(fread("summary_metrics_HCT116_S.csv", stringsAsFactors = F))
+tmp <- df[which(df$REMOVE_MAD_depthless1M == 0),]
+tmp$barcode <- gsub("-1", "", tmp$barcode)
+tmp <- tmp[,1]
+write.table(tmp, "idx_hctS_MAD_depth.txt", sep="\t", quote=F, row.names=F, col.names=F)
+
+# Step 4b: Generating single cell RT wavelet scores from mappability-corrected 200k40k sliding window data ----
+
+df <- read.table("HCT116_200K40K_mergedCounts.txt", stringsAsFactors = F, header=T)
+row.names(df) <- df$id
+
+# find median
+df.tmp <- df[,c(6:(ncol(df)-1))]
+df.med <- apply(df.tmp, 2, function(x) median(x[x!=0]))
+
+# log2 calc
+df.adj <- sapply(colnames(df.tmp), function(x) log2(df.tmp[,x]/df.med[[x]]))
+df.adj <- as.data.frame(df.adj)
+rownames(df.adj) <- rownames(df.tmp)
+df.adj$id <- rownames(df.adj)
+
+# assign scores into middle 40kb of each 200kb window
+tmp <- df[which(df$width == 200000),]
+scrt.gr <- GRanges(tmp$seqnames, IRanges(tmp$start+80000, tmp$end-80000), strand="*", id=tmp$id)
+scrt <- as.data.frame(scrt.gr)
+scrtdf <- merge(scrt, df.adj, by="id", sort=FALSE)
+
+# making matrixes for correlation plots and tSNE
+# remove values outside median+/-1.5xIQR range
+
+iqr <- apply(scrtdf[,c(7:ncol(scrtdf))], 2, function(x) IQR(x[is.finite(x)]))
+iqr.1.5 <- 1.5*iqr
+scrt.med <- apply(scrtdf[,c(7:ncol(scrtdf))], 2, function (x) median(x[is.finite(x)]))
+
+iqr.low <- scrt.med-iqr.1.5
+iqr.high <- scrt.med+iqr.1.5
+
+scrt.iqr <-  scrtdf[,c(1:6)]
+for  (i in colnames(scrtdf)[c(7:ncol(scrtdf))])  {
+  data <- scrtdf[,i]
+  data[is.infinite(data)] <- NaN
+  data[which(data < iqr.low[i])] <- iqr.low[i]
+  data[which(data > iqr.high[i])] <- iqr.high[i]
+  scrt.iqr[,i] <- data
+  cat(i)
+}
+
+hctg1.idx <- read.table("idx_merge_hctG1.txt")
+hctg1.idx$name <- paste0("hct_G1_", hctg1.idx$V1)
+
+hcts.idx <- read.table("idx_hctS_MAD_depth.txt")
+hcts.idx$name <- paste0("hct_S_", hcts.idx$V1)
+
+idx <- c(hctg1.idx$name, hcts.idx$name)
+
+tmp  <- scrt.iqr[,idx]
+matrix <- as.matrix(tmp)
+rownames(matrix) <- scrt.iqr$id
+nonas <- apply(matrix, 1, function (x) all(!is.na(x)))
+matrix <- matrix[nonas,]
+
+save(matrix, file="HCT116_200K40K_scRT_IQR_matrix.RData")
+
+# Step 4c: Identifying S-phase cells that cluster with G1 ----
+
+# hierarchical clustering
+
+load("HCT116_200K40K_scRT_IQR_matrix.RData")
+
+corr <- cor(matrix)
+col<- colorRampPalette(c("blue", "white", "red"))(20)
+
+heatmap.2(x = corr, col = col, symm = TRUE, 
+          hclustfun = function(x) hclust(x, method="ward.D2"),
+          RowSideColors = c(rep("purple", length(grep("G1", rownames(corr)))), rep("orange", length(grep("S", rownames(corr))))), 
+          ColSideColors = c(rep("purple", length(grep("G1", rownames(corr)))), rep("orange", length(grep("S", rownames(corr))))), 
+          scale="none", trace="none", key=TRUE)
+
+d <- dist(corr)
+clust <- hclust(d, method="ward.D2")
+names(clust)
+clust$labels[grep("G1", clust$labels)] <- "G1"
+clust$labels[grep("S", clust$labels)] <- "S"
+groupCodes <- clust$labels
+colorCodes <- c(G1="green", S="red")
+
+dend <- as.dendrogram(clust)
+library(dendextend)
+labels_colors(dend) <- colorCodes[groupCodes][order.dendrogram(dend)]
+plot(dend)
+par(cex = 1)
+plot(dend[[1]], horiz = TRUE)
+plot(dend[[2]], horiz = TRUE) 
+
+# figure out which S cluster with G1
+str(dend[[2]])
+tmp <- dend[[2]]
+tmp[[1]]
+tmp <- unlist(tmp, use.names=T)
+clust$labels[tmp]
+idx <- grep("S", clust$labels[tmp], value=T)
+
+write.table(idx, "HCT116_S_clustwG1_hclust_idx.txt", sep="\t", quote=F, row.names=F, col.names=F) 
+
+# Rtsne
+
+load("HCT116_200K40K_scRT_IQR_matrix.RData")
+matrix <- t(matrix) #each cell is a row
+
+X <- normalize_input(matrix)
+
+tsne_out <- Rtsne(matrix)
+cols <- as.data.frame(do.call(rbind, strsplit(rownames(matrix), "_")))[,2]
+
+pdf(file="HCT116_200K40K_tsne.pdf")
+plot(tsne_out$Y, col=cols, asp=1, pch=19)
+dev.off()
+
+df <- as.data.frame(tsne_out$Y)
+df$cell <- rownames(matrix)
+df2 <- df[which(df$V1 < -6 & df$V2 < -6),] # coordinates based on HCT116_200K40K_tsne.pdf
+idx <- grep("_S_", df2$cell, value=T)
+
+write.table(idx, "HCT116_S_clustwG1_tsne_idx.txt", sep="\t", quote=F, row.names=F, col.names=F) 
+
+```
+
+# Step 5: Generating binarised 80kb data and calculaing single cell variability/heterogeneity scores
+```{r}
+# Step 5a: Binarising 80kb count data ----
+
+outpath <- "hctS_findCNV_80k/"
+inpath <- "hctS_mapadj_80k/"
+
+load(paste0(inpath, "HCT116_80k_mapCorrected.RData"))
+
+for (i in names(map.win)) {
+	model <- findCNVs(map.win[[i]], method="HMM", max.iter=3000, states=c("zero-inflation","0-somy","1-somy","2-somy"), most.frequent.state = "1-somy", eps=0.01, num.threads=8)
+	save(model, file=paste0(outpath, "models_1-somy/", i, "_findCNVs_model.RData"))
+	cat(i)
+}
+
+for (i in names(map.win)) {
+	model <- findCNVs(map.win[[i]], method="HMM", max.iter=3000, states=c("zero-inflation","0-somy","1-somy","2-somy"), most.frequent.state = "2-somy", eps=0.01, num.threads=8)
+	save(model, file=paste0(outpath, "models_2-somy/", i, "_findCNVs_model.RData"))
+	cat(i)
+}
+
+#
+
+modelfiles <- grep("RData", list.files(paste0(outpath, "models_1-somy"), full.names=T), value=T)
+names(modelfiles) <- gsub("_findCNV.*", "", basename(modelfiles))
+
+load(modelfiles[1])
+tmp <- as.data.frame(model$bins, stringsAsFactors = F)
+model.bins <- tmp[,1:5]
+for (i in names(modelfiles)) {
+	load(modelfiles[i])
+  model.bins[,i] <- model$bins$copy.number
+  cat(i)
+}
+write.table(model.bins, paste0(outpath, "models_1-somy_tbl/hctS_1-somy_model_bins_copy_number.txt"), sep="\t", quote=F, row.names=F)
+
+#
+
+modelfiles <- grep("RData", list.files(paste0(outpath, "models_2-somy"), full.names=T), value=T)
+names(modelfiles) <- gsub("_findCNV.*", "", basename(modelfiles))
+
+load(modelfiles[1])
+tmp <- as.data.frame(model$bins, stringsAsFactors = F)
+model.bins <- tmp[,1:5]
+for (i in names(modelfiles)) {
+	load(modelfiles[i])
+  model.bins[,i] <- model$bins$copy.number
+  cat(i)
+}
+write.table(model.bins, paste0(outpath, "models_2-somy_tbl/hctS_2-somy_model_bins_copy_number.txt"), sep="\t", quote=F, row.names=F)
+
+# Step 5b: Calculating % replication score per cell ----
+
+repscorecalc <- function(x) {
+  score <- 100*sum(x==2)/sum(x!=0)
+  score
+}
+
+tbl <- as.data.frame(fread("hctS_2-somy_model_bins_copy_number.txt", stringsAsFactors=F)) #example using complete 2-somy table, filter out S-phase cells identified in step 4C when applying to your data
+rtscores <- sapply(colnames(tbl)[c(6:ncol(tbl))], function(x) repscorecalc(tbl[,x]))
+rtscores <- as.data.frame(rtscores)
+rtscores$cell <- rownames(rtscores)
+rtscores
+
+# ordering cells by % replication score
+
+colnames(tbl)[c(6:ncol(tbl))] <- paste0("rt_", round(rtscores$rtscores, 2), "_", colnames(tbl)[c(6:ncol(tbl))])
+idx <- colnames(tbl)[c(6:ncol(tbl))]
+idx <- sort(idx)
+tmp <- tbl[,idx]
+hctS.80kb.rtorder <- cbind(tbl[,c(1:5)], tmp)
+
+write.table(hctS.80kb.rtorder, "hctS_80kb_rtordered.txt", sep="\t", quote=F, row.names=F) 
+
+# Step 5c: Calculating single cell variability and heterogeneity metrics ----
+
+# cell-to-cell variability of Mid S-cells ----
+
+hctS.80kb.rtorder <- read.table("hctS_80kb_rtordered.txt", header=T, stringsAsFactors = F)
+
+tmp <- colnames(hctS.80kb.rtorder)[c(6:ncol(hctS.80kb.rtorder))]
+tmp <- as.data.frame(do.call(rbind, strsplit(tmp, "_")), stringsAsFactors=F)
+tmp <- tmp[which(tmp$V2 >= 40 & tmp$V2 <= 70),]
+idx <- paste0(tmp$V1, "_", tmp$V2, "_", tmp$V3, "_", tmp$V4, "_", tmp$V5)
+
+tmp <- apply(hctS.80kb.rtorder[,idx], 1, function(x) as.data.frame(t(as.data.frame.AsIs(table(x)))))
+names(tmp) <- paste0(hctS.80kb.rtorder$seqnames, "_", hctS.80kb.rtorder$start)
+
+tmp <- rbindlist(tmp, fill=T, use.names = T, idcol = T)
+colnames(tmp) <- c("bin", "0", "1", "2")
+
+tmp$`1`[is.na(tmp$`1`)] <- 0
+tmp$`2`[is.na(tmp$`2`)] <- 0
+tmp$prop1 <- tmp$`1`/(tmp$`1`+tmp$`2`)
+tmp$prop2 <- tmp$`2`/(tmp$`1`+tmp$`2`)
+tmp$min <- ifelse(tmp$prop1 > tmp$prop2, tmp$prop2, tmp$prop1)
+tmp$var <- tmp$min/0.5
+
+hctS.var <- as.data.frame(tmp, stringsAsFactors=F)
+
+# single cell RT value of a given genomic bin ----
+
+hctS.80kb.rtorder <- read.table("hctS_80kb_rtordered.txt", header=T, stringsAsFactors = F)
+
+tmp <- hctS.80kb.rtorder[,c(6:ncol(hctS.80kb.rtorder))]
+ones <- apply(tmp, 1, function(x) length(which(x==1)))
+twos <- apply(tmp, 1, function(x) length(which(x==2)))
+
+df <- as.data.frame(cbind(ones, twos), stringsAsFactors=F)
+df <- cbind(df, hctS.80kb.rtorder[,c(1:3)])
+df$sum <- df$ones + df$twos
+df$ones.percent <- df$ones/(df$ones+df$twos) # single cell RT value of a given bin
+df$rtscore.percent <- percent_rank(df$ones.percent) 
+df$onepercentile <- cut(df$rtscore.percent, breaks=seq(0, 1, by=0.01), names=T, include.lowest=T, na.rm=T) # score divided into 100 1-percentile bins
+
+write.table(df, "hct_single_cell_RT_value_per_bin.txt", sep="\t", quote=F, row.names=F) 
+
+# RT sigmoid modelling ----
+
+hctS.80kb.rtorder <- read.table("hctS_80kb_rtordered.txt", header=T, stringsAsFactors = F)
+
+tmp <- colnames(hctS.80kb.rtorder)[c(6:ncol(hctS.80kb.rtorder))]
+tmp <- as.data.frame(do.call(rbind, strsplit(tmp, "_")), stringsAsFactors=F)
+tmp$rtpercent <- as.numeric(tmp$V2)
+tmp$cell <- paste0(tmp$V1, "_", tmp$V2, "_", tmp$V3, "_", tmp$V4, "_", tmp$V5)
+tmp$rtpercentrank <- 100*percent_rank(tmp$rtpercent)
+
+# dividing cells into 15-percentile groups, sliding by 5-percentile to get 18 overlapping groups
+tmp$percentile15a <- cut(tmp$rtpercentrank, breaks=seq(0, 100, by=15), names=T, include.lowest=T, na.rm=T)
+tmp$percentile15b <- cut(tmp$rtpercentrank, breaks=seq(5, 100, by=15), names=T, include.lowest=T, na.rm=T)
+tmp$percentile15c <- cut(tmp$rtpercentrank, breaks=seq(10, 100, by=15), names=T, include.lowest=T, na.rm=T)
+
+l1 <- split(tmp[,c("percentile15a", "cell")], tmp$percentile15a)
+l2 <- split(tmp[,c("percentile15b", "cell")], tmp$percentile15b)
+l3 <- split(tmp[,c("percentile15c", "cell")], tmp$percentile15c)
+ll <- c(l1, l2, l3)
+
+# calculating percentage replication score per group per loci against average % RT per group
+tbl.list <- list()
+for (i  in  names(ll)) {
+  tbl <- hctS.80kb.rtorder[,ll[[i]]$cell]
+  tbl$is1 <- apply(tbl, 1, function(x) length(which(x==1)))
+  tbl$is2 <- apply(tbl, 1, function(x) length(which(x==2)))
+  tbl$percentreplicated <- tbl$is2/(tbl$is1+tbl$is2)
+  tbl <- tbl[,c((ncol(tbl)-2):ncol(tbl))]
+  tbl$bin <- paste0(hctS.80kb.rtorder$seqnames, "_", hctS.80kb.rtorder$start)
+  
+  avgscore <-  as.data.frame(do.call(rbind, strsplit(ll[[i]]$cell,  "_")), stringsAsFactors=F)
+  tbl$avgRT <- mean(as.numeric(avgscore$V2))
+  
+  tbl.list[[i]] <- tbl
+  cat(i)
+}
+
+tmp <-  as.data.frame(do.call(rbind, tbl.list), stringsAsFactors=F)
+tmp2 <-  as.data.frame(do.call(rbind, strsplit(rownames(tmp), "[.]")), stringsAsFactors=F)
+tmp$group <-  tmp2$V1
+rtloci <- tmp
+
+# average score per group including pseudo groups 0% and 100% replicated as described in Takahashi et al, this is the x-axis
+rtloci.avgscore <-  unique(rtloci[,c("avgRT", "group")])
+rtloci.avgscore <-  rbind(rtloci.avgscore,  c(0, "early0"), c(100, "late1"))
+rtloci.avgscore <- rtloci.avgscore[match(c("early0","[0,15]", "[5,20]","[10,25]","(15,30]", "(20,35]","(25,40]","(30,45]","(35,50]","(40,55]", "(45,60]","(50,65]","(55,70]","(60,75]","(65,80]","(70,85]","(75,90]", "(80,95]", "(85,100]", "late1"), rtloci.avgscore$group),]
+
+# table of percent replication score per loci across all 18 groups including pseudo groups
+tmp <- as.data.frame(cast(rtloci, bin ~ group, value="percentreplicated"))
+tmp$early0 <- 0
+tmp$late1 <- 1
+tmp <-  tmp[,c("bin", "early0","[0,15]", "[5,20]","[10,25]","(15,30]", "(20,35]","(25,40]","(30,45]","(35,50]","(40,55]", "(45,60]","(50,65]","(55,70]","(60,75]","(65,80]","(70,85]","(75,90]", "(80,95]", "(85,100]", "late1")]
+df <- tmp
+
+# single cell RT value of each genomic bin
+mtbl <-  read.table("hct_single_cell_RT_value_per_bin.txt", stringsAsFactors=F, header=T)
+mtbl$bin <- paste0(mtbl$seqnames, "_",  mtbl$start)
+
+df  <- merge(df, mtbl[,c("ones.percent", "bin")], by="bin")
+
+# formula
+y = 100/(1+e^(-g*(x-M)))
+
+g #gain/slope
+x #s-phase time per group i.e. 
+M #s intercept at sigmoid's midpoint - represents when 50% of cells have replicated the bin
+  #aka, s-phase time of a genomic bin on the basis of the single cell RT values i.e. mtbl
+
+# calculating gain values
+p.list <- list()
+for (i  in  df$bin) {
+  tryCatch({
+    xx <- as.data.frame(t(df[df$bin == i, c(2:21)]))
+    xx$x <- as.numeric(rtloci.avgscore$avgRT)
+    colnames(xx) <- c("y", "x")
+    xx$y <- 100*xx$y
+    model <- nls(y ~ 100/(1+exp(-g*(x-M))), data=xx, start=list(g=0.1, M=100*df$ones.percent[df$bin == i]))
+    p <- coef(model)
+    p.list[[i]] <- c(p["g"], p["M"])
+  },  error=function(e) paste("error"))
+  cat(i)
+}
+
+df.gain <- as.data.frame(do.call(rbind, p.list), stringsAsFactors=F)
+df.gain$bin <- rownames(df.gain)
+hctS.gain <- merge(df, df.gain, by="bin")
+
+```

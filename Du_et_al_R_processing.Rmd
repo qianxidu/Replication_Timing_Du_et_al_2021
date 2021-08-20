@@ -1,0 +1,584 @@
+---
+title: "Du et al R processing"
+author: Qian Du
+---
+
+# Libraries
+```{r}
+library(GenomicRanges)
+library(rtracklayer)
+library(reshape2)
+library(data.table)
+library(BSgenome.Hsapiens.UCSC.hg19)
+library(Repitools)
+library(dplyr)
+library(plyr)
+library(gplots)
+library(tidyr)
+library(preprocessCore)
+
+minGR.mcols <- function(x) {
+  mcols(x) <- NULL
+  x
+}
+```
+
+# calling PMD boundaries with different degrees of shift between HCT116 and DKO1
+```{r}
+#--- preparing PMD regions ----
+dko.1.pmd <- import(".../methpipe/DKO1_Rep1/DKO1_Rep1.pmd.bed")
+seqlevels(dko.1.pmd, force=TRUE) <- seqlevels(Hsapiens)[1:23] 
+seqlengths(dko.1.pmd) <- seqlengths(Hsapiens)[1:23]
+dko.2.pmd <- import(".../methpipe/DKO1_Rep2/DKO1_Rep2.pmd.bed")
+seqlevels(dko.2.pmd, force=TRUE) <- seqlevels(Hsapiens)[1:23] 
+seqlengths(dko.2.pmd) <- seqlengths(Hsapiens)[1:23]
+
+hct.1.pmd <- import(".../methpipe/HCT116_Rep1/HCT116_Rep1.pmd.bed")
+seqlevels(hct.1.pmd, force=TRUE) <- seqlevels(Hsapiens)[1:23] 
+seqlengths(hct.1.pmd) <- seqlengths(Hsapiens)[1:23]
+hct.2.pmd <- import(".../methpipe/HCT116_Rep2/HCT116_Rep2.pmd.bed")
+seqlevels(hct.2.pmd, force=TRUE) <- seqlevels(Hsapiens)[1:23] 
+seqlengths(hct.2.pmd) <- seqlengths(Hsapiens)[1:23]
+
+dko.pmd <- reduce(c(dko.1.pmd, dko.2.pmd), ignore.strand=T)
+hct.pmd <- reduce(c(hct.1.pmd, hct.2.pmd), ignore.strand=T)
+
+hct.pmd <- sort(hct.pmd)
+hct.pmd <- hct.pmd[which(width(hct.pmd) > 50000)]
+hct.pmd <- reduce(hct.pmd, min.gapwidth=50000)
+
+dko.pmd <- sort(dko.pmd)
+dko.pmd <- dko.pmd[which(width(dko.pmd) > 50000)]
+dko.pmd <- reduce(dko.pmd, min.gapwidth=50000)
+
+#--- Identifying corresponding PMD boundaries between HCT116 and DKO1 and calculating degree of shift ----
+# Possible overlapping categories ----
+  #- non-overlapping
+  #- overlapping 1-to-1 between HCT116 and DKO1
+  #- overlapping 1-to-many or many-to-1 between HCT116 and DKO1
+      #- use the closest DKO1 boundary to the HCT116 boundary
+
+#--- overlapping one to one - where overlap queryHits==1 and subject hits==1 ----
+pmd.ov <- as.data.frame(findOverlaps(hct.pmd, dko.pmd))
+
+tbl <- as.data.frame(table(pmd.ov$queryHits))
+tbl <- tbl[which(tbl$Freq==1),]
+pmd.ov.test <- pmd.ov[pmd.ov$queryHits %in% tbl$Var1,]
+tbl <- as.data.frame(table(pmd.ov.test$subjectHits))
+tbl <- tbl[which(tbl$Freq==1),]
+pmd.ov.test2 <- pmd.ov.test[pmd.ov.test$subjectHits %in% tbl$Var1,]
+
+hct.pmd.oneone <- hct.pmd[pmd.ov.test2$queryHits]
+hct.pmd.oneone$idx.d <- pmd.ov.test2$subjectHits
+hct.pmd.oneone$chr.d <- seqnames(dko.pmd)[pmd.ov.test2$subjectHits]
+
+hct.pmd.oneone$start.d <- start(dko.pmd)[pmd.ov.test2$subjectHits]
+hct.pmd.oneone$end.d <- end(dko.pmd)[pmd.ov.test2$subjectHits]
+hct.pmd.oneone$start.diff <- hct.pmd.oneone$start.d-start(hct.pmd.oneone)
+hct.pmd.oneone$end.diff <- hct.pmd.oneone$end.d-end(hct.pmd.oneone)
+
+hct.pmd.oneone$prime5.coord <- start(hct.pmd.oneone) + hct.pmd.oneone$start.diff
+hct.pmd.oneone$prime3.coord <- end(hct.pmd.oneone) + hct.pmd.oneone$end.diff
+hct.pmd.oneone$cat <- "oneone"
+
+#--- overlapping many HCT116 to one DKO1 - where table queryHits==1 but subject hits > 1 ----
+pmd.ov <- as.data.frame(findOverlaps(hct.pmd, dko.pmd))
+
+tbl <- as.data.frame(table(pmd.ov$queryHits))
+tbl <- tbl[which(tbl$Freq==1),]
+pmd.ov.test <- pmd.ov[pmd.ov$queryHits %in% tbl$Var1,]
+tbl <- as.data.frame(table(pmd.ov.test$subjectHits))
+tbl <- tbl[which(tbl$Freq>1),]
+pmd.ov.test2 <- pmd.ov.test[pmd.ov.test$subjectHits %in% tbl$Var1,]
+tmp5 <- pmd.ov.test2[!duplicated(pmd.ov.test2$subjectHits),]
+tmp3 <- pmd.ov.test2[!duplicated(pmd.ov.test2$subjectHits, fromLast=T),]
+
+hct.pmd.manyone <- hct.pmd[tmp5$queryHits]
+hct.pmd.manyone$idx.d <- tmp5$subjectHits
+hct.pmd.manyone$chr.d <- seqnames(dko.pmd)[tmp5$subjectHits]
+hct.pmd.manyone$start.d <- start(dko.pmd)[tmp5$subjectHits]
+hct.pmd.manyone$end.d <- end(dko.pmd)[tmp5$subjectHits]
+hct.pmd.manyone$start.diff <- hct.pmd.manyone$start.d-start(hct.pmd.manyone)
+hct.pmd.manyone$end.diff <- NaN
+
+hct.pmd.manyone2 <- hct.pmd[tmp3$queryHits]
+hct.pmd.manyone2$idx.d <- tmp3$subjectHits
+hct.pmd.manyone2$chr.d <- seqnames(dko.pmd)[tmp3$subjectHits]
+hct.pmd.manyone2$start.d <- start(dko.pmd)[tmp3$subjectHits]
+hct.pmd.manyone2$end.d <- end(dko.pmd)[tmp3$subjectHits]
+hct.pmd.manyone2$start.diff <- NaN
+hct.pmd.manyone2$end.diff <- hct.pmd.manyone2$end.d-end(hct.pmd.manyone2)
+
+hct.pmd.manyone <- c(hct.pmd.manyone, hct.pmd.manyone2)
+hct.pmd.manyone$cat <- "manyone"
+
+#--- overlapping one HCT116 to many DKO1 - where table queryHits>1 but subject hits==1 ----
+pmd.ov <- as.data.frame(findOverlaps(hct.pmd, dko.pmd))
+
+tbl <- as.data.frame(table(pmd.ov$queryHits))
+tbl <- tbl[which(tbl$Freq>1),]
+pmd.ov.test <- pmd.ov[pmd.ov$queryHits %in% tbl$Var1,]
+tbl <- as.data.frame(table(pmd.ov.test$subjectHits))
+tbl <- tbl[which(tbl$Freq==1),]
+tmp5 <- pmd.ov.test[!duplicated(pmd.ov.test$queryHits),]
+tmp3 <- pmd.ov.test[!duplicated(pmd.ov.test$queryHits, fromLast=T),]
+
+hct.pmd.onemany <- hct.pmd[tmp5$queryHits]
+hct.pmd.onemany$idx.d <- tmp5$subjectHits
+hct.pmd.onemany$chr.d <- seqnames(dko.pmd)[tmp5$subjectHits]
+hct.pmd.onemany$start.d <- start(dko.pmd)[tmp5$subjectHits]
+hct.pmd.onemany$end.d <- end(dko.pmd)[tmp5$subjectHits]
+hct.pmd.onemany$start.diff <- hct.pmd.onemany$start.d-start(hct.pmd.onemany)
+hct.pmd.onemany$end.diff <- NaN
+
+hct.pmd.onemany2 <- hct.pmd[tmp3$queryHits]
+hct.pmd.onemany2$idx.d <- tmp3$subjectHits
+hct.pmd.onemany2$chr.d <- seqnames(dko.pmd)[tmp3$subjectHits]
+hct.pmd.onemany2$start.d <- start(dko.pmd)[tmp3$subjectHits]
+hct.pmd.onemany2$end.d <- end(dko.pmd)[tmp3$subjectHits]
+hct.pmd.onemany2$start.diff <- NaN
+hct.pmd.onemany2$end.diff <- hct.pmd.onemany2$end.d-end(hct.pmd.onemany2)
+
+hct.pmd.onemany <- c(hct.pmd.onemany, hct.pmd.onemany2)
+hct.pmd.onemany$cat <- "onemany"
+
+#--- categorising and exporting HCT116 boundaries by extent of shift of DKO1 boundary, 5' and 3' ----
+names(mcols(hct.pmd.oneone))
+names(mcols(hct.pmd.manyone))
+names(mcols(hct.pmd.onemany))
+
+com.cols <- c("idx.d","chr.d","start.d","end.d","start.diff","end.diff","cat")
+gr.a <- hct.pmd.oneone
+values(gr.a) <- values(hct.pmd.oneone)[com.cols]
+gr.b <- hct.pmd.manyone
+values(gr.b) <- values(hct.pmd.manyone)[com.cols]
+gr.c <- hct.pmd.onemany
+values(gr.c) <- values(hct.pmd.onemany)[com.cols]
+
+gr.all <- c(gr.a, gr.b, gr.c)
+
+tmp <- gr.all[which(gr.all$start.diff > 0)]
+strand(tmp) <- "+"
+tmp$lencat <- "else"
+tmp$lencat[which(tmp$start.diff <= 50000)] <- "50K"
+tmp$lencat[which(tmp$start.diff > 50000 & tmp$start.diff <= 200000)] <- "50-200K"
+tmp$lencat[which(tmp$start.diff > 200000 & tmp$start.diff <= 500000)] <- "200-500K"
+tmp$lencat[which(tmp$start.diff > 500000)] <- "over500K"
+tmp <- resize(tmp, fix="start", width=1)
+boundary5 <- split(tmp, tmp$lencat)
+
+tmp <- gr.all[which(gr.all$end.diff < 0)]
+strand(tmp) <- "-"
+tmp$lencat <- "else"
+tmp$lencat[which(tmp$end.diff >= -50000)] <- "50K"
+tmp$lencat[which(tmp$end.diff < -50000 & tmp$end.diff >= -200000)] <- "50-200K"
+tmp$lencat[which(tmp$end.diff < -200000 & tmp$end.diff >= -500000)] <- "200-500K"
+tmp$lencat[which(tmp$end.diff < -500000)] <- "over500k"
+tmp <- resize(tmp, fix="end", width=1)
+boundary3 <- split(tmp, tmp$lencat)
+
+export(c(minGR.mcols(boundary5[[3]]), minGR.mcols(boundary3[[3]])), paste0("pmd_lost_", names(boundary5)[3], ".bed"))
+export(c(minGR.mcols(boundary5[[2]]), minGR.mcols(boundary3[[2]])), paste0("pmd_lost_", names(boundary5)[2], ".bed"))
+export(c(minGR.mcols(boundary5[[1]]), minGR.mcols(boundary3[[1]])), paste0("pmd_lost_", names(boundary5)[1], ".bed"))
+export(c(minGR.mcols(boundary5[[4]]), minGR.mcols(boundary3[[4]])), paste0("pmd_lost_", names(boundary5)[4], ".bed"))
+
+```
+
+# weighted variance
+```{r}
+
+weightedVariance <- function(Y.PN, x.N, Y) {
+  xbar.P <- (Y.PN %*% x.N)/Y
+
+  d2.PN <- outer(xbar.P, x.N, "-")^2 
+  d2.PN <- d2.PN[,,]
+
+  var.P <- rowSums(d2.PN * Y.PN) / Y
+  var.P
+}
+
+
+df # PNDV table, 6 columns, one for each fraction, ordered G1, S1, S2, S3, S4, G2. Rows are loci
+x.N <- (1:6)/6 # neutral loci
+weiVar <- weightedVariance(as.matrix(df), x.N = x.N, Y = 100)
+
+```
+
+# allelic Repli-Seq processing
+```{r}
+#--- filtering phased SNPs and creating bed files for downstream use ----
+# see Nanopore_medaka_phased_SNPs_allelicRT.sh
+
+vcf.hct <- as.data.frame(fread("0002_extracted.vcf", stringsAsFactors = F))
+colnames(vcf.hct) <- c("chr", "start", "REF", "ALT", "QUAL", "TYPE", "GT", "GQ", "PS", "pos1", "q1", "pos2", "q2")
+
+vcf.hct$GT <- gsub("HCT=", "", vcf.hct$GT)
+vcf.hct$GQ <- as.numeric(gsub("HCT=", "", vcf.hct$GQ))
+vcf.hct$PS <- as.integer(gsub("HCT=", "", vcf.hct$PS))
+
+vcf.dko <- as.data.frame(fread("0003_extracted.vcf", stringsAsFactors = F))
+colnames(vcf.dko) <- c("chr", "start", "REF", "ALT", "QUAL", "TYPE", "GT", "GQ", "PS", "pos1", "q1", "pos2", "q2")
+
+vcf.dko$GT <- gsub("DKO=", "", vcf.dko$GT)
+vcf.dko$GQ <- as.numeric(gsub("DKO=", "", vcf.dko$GQ))
+vcf.dko$PS <- as.integer(gsub("DKO=", "", vcf.dko$PS))
+
+hd.vcf <- vcf.hct
+colnames(hd.vcf) <- c("chr", "start", "REF", "ALT.h", "QUAL.h", "TYPE", "GT.h", "GQ.h", "PS.h", "pos1.h", "q1.h", "pos2.h", "q2.h")
+hd.vcf <- cbind(hd.vcf, vcf.dko[,c("ALT", "QUAL", "GT", "GQ", "PS", "pos1", "q1", "pos2", "q2")])
+colnames(hd.vcf) <- c("chr", "start", "REF", "ALT.h", "QUAL.h", "TYPE", "GT.h", "GQ.h", "PS.h", "pos1.h", "q1.h", "pos2.h", "q2.h", "ALT.d", "QUAL.d", "GT.d", "GQ.d", "PS.d", "pos1.d", "q1.d", "pos2.d", "q2.d")              
+
+hd.vcf$QUAL.h <- as.numeric(hd.vcf$QUAL.h)
+hd.vcf$QUAL.d <- as.numeric(hd.vcf$QUAL.d)
+
+hd.vcf <- hd.vcf[-grep("_", hd.vcf$chr),]
+
+## filtering for phased heterozygous SNPs and quality score, exporting SNP bed files, example for HCT116 
+hd.vcf.ps$GT.comb <- paste0(hd.vcf.ps$GT.h, "_", hd.vcf.ps$GT.d)
+hd.vcf.ps <- hd.vcf.ps[hd.vcf.ps$GT.comb %in% c("0/1_0|1", "0/1_1|0", "0|1_0/1", "0|1_0|1",  "0|1_1|0",  "1|0_0/1", "1|0_0|1", "1|0_1|0"),] 
+
+hd.vcf.ps.h <- hd.vcf.ps[hd.vcf.ps$QUAL.h >= 20,]
+
+hd.vcf.ps.h <- hd.vcf.ps.h[!is.na(hd.vcf.ps.h$start),]
+
+hd.vcf.ps.h <- hd.vcf.ps.h[hd.vcf.ps.h$GT.h %in% c("0|1", "1|0"),]
+
+hd.vcf.ps.h.gr <- GRanges(seqnames=hd.vcf.ps.h$chr, IRanges(start=hd.vcf.ps.h$start, width=1), strand="*", hd.vcf.ps.h[,c(3:24)])
+tmp <- unvalue(hd.vcf.ps.2h.gr)
+export(tmp, "hct_phased_filtered.bed")
+
+## exporting haplotypes as bed for PNDV, example for HCT116 
+hd.vcf.ps.h
+tmp <- split(hd.vcf.ps.h, hd.vcf.ps.h$PS.h)
+
+chr1 <- sapply(1:length(tmp), function(x) tmp[[x]][1,"chr"])
+start1 <- sapply(1:length(tmp), function(x) tmp[[x]][1,"start"])
+end1 <- sapply(1:length(tmp), function(x) tmp[[x]][nrow(tmp[[x]]),"start"])
+ps <- sapply(1:length(tmp), function(x) tmp[[x]][1,"PS.h"])
+
+gr <- GRanges(chr1, IRanges(start1, end1), strand="*", name=ps)
+export(gr, "HCT116_phased_filtered_haploblocks.bed")
+
+#--- defining Repli-Seq sliding windows that are contained within haplotype blocks ----
+# example for HCT116 
+
+## making Repli-Seq sliding windows bed file
+# window size
+wb <- 50000
+# spacing for window sliding
+s <- 1000
+
+chromNames <- names(Hsapiens)[1:23]
+chromLengths <- seqlengths(Hsapiens)[chromNames]
+
+windowsRT <- genomeBlocks(Hsapiens, chromNames, width=wb, spacing=s)
+windowsRT <- windowsRT[width(windowsRT)==wb]
+windowsRT <- sort(windowsRT)
+windowsRT$name <- c(1:length(windowsRT))
+export(windowsRT, "windows_w50kb_s1kb.bed")
+
+## making Repli-Seq sliding windows granges file with identifiers for center, left and right of each window
+windowsRT <- genomeBlocks(Hsapiens, chromNames, width=wb, spacing=s)
+windowsRT <- windowsRT[width(windowsRT)==wb]
+windowsRT <- sort(windowsRT)
+tmp <- resize(windowsRT, width=1000, fix="center")
+windowsRT$centerKb <- paste0(seqnames(tmp), "_", start(tmp)) #center ID of each window
+windowsRT$left <- paste0(seqnames(windowsRT), "_", start(windowsRT)) #left ID of each window
+windowsRT$right <- paste0(seqnames(windowsRT), "_", end(windowsRT)) #right ID of each window
+
+## intersecting haplotype blocks and Repli-Seq windows with bedtools
+
+# bedtools intersect -wb -a HCT116_phased_filtered_haploblocks.bed -b windows_w50kb_s1kb.bed > blocks_HCThap.bed
+# For each window, reports the intersecting haplotype block. This gives restricted coordinates of windows that are within the haplotype block e.g. if the window overhangs the edge of the haplotype block, the coordinate of the haplotype block is used
+
+## exporting filtered windows for PNDV processing
+blocks <- as.data.frame(fread("blocks_HCThap.bed", stringsAsFactors=F))
+blocks <- GRanges(blocks$V1, IRanges(blocks$V2+1, blocks$V3), strand="*", blocks[,c(4,7:10)])
+seqlevels(blocks, force=TRUE) <- seqlevels(Hsapiens)[1:23]
+seqlengths(blocks) <- seqlengths(Hsapiens)[1:23]
+blocks <- sort(blocks)
+
+blocks$left <- paste0(blocks$V7, "_", (blocks$V8+1)) #left coordinate of Repli-Seq window
+
+df <- merge(as.data.frame(blocks), as.data.frame(windowsRT), by="left") #merging haplotype blocks and Repli-Seq window files by left coordinate
+blocksF <- GRanges(df$seqnames.x, IRanges(df$start.x, df$end.x), strand="*", df[,c(7:11, 17)])
+seqlevels(blocksF, force=TRUE) <- seqlevels(Hsapiens)[1:23]
+seqlengths(blocksF) <- seqlengths(Hsapiens)[1:23]
+blocksF <- sort(blocksF)
+tmp <- unvalue(blocksF)
+tmp$name <- blocksF$centerKb
+export(tmp, "blocks_HCThap_centre1kb.bed")
+
+#--- making PNDV bigwigs and WA bigwigs with only bins within haplotype blocks
+load("PNDVs.RData") # See "Du_et_al_Repli-Seq_processing_bam_to_PNDV.R"
+
+df <- as.data.frame(do.call(rbind, strsplit(blocks$name, "_")), stringsAsFactors=F)
+blocks$centerchr <- df$V1
+blocks$centerstart <- as.numeric(df$V2)
+blocks$chrom <- as.character(seqnames(blocks))
+blocks$left <- as.numeric(start(blocks))
+blocks$right <- as.numeric(end(blocks))
+
+blocks$left.diff <- blocks$centerstart - blocks$left #if positive, then start of 1kb Repli-Seq bin is within left boundary of haplotype block
+blocks$right.diff <- blocks$right - (blocks$centerstart+999) #if positive, then end of 1kb Repli-Seq bin is within right boundary of haplotype block
+
+idx <- which(blocks$left.diff > 0 & blocks$right.diff > 0)
+blocksR <- GRanges(blocks$centerchr, IRanges(blocks$centerstart, width=1000))
+seqlevels(blocksR, force=TRUE) <- seqlevels(Hsapiens)[1:23]
+seqlengths(blocksR) <- seqlengths(Hsapiens)[1:23]
+  
+outpath="..."
+for(rep_name in names(pndvs_good)){
+	count <- pndvs_good[[rep_name]]
+	for(i in colnames(count)){
+		T <- blocksR[idx]
+		score(T) <- count[idx,i]
+		export(T, paste0(outpath, gsub(".asd.bam", "", i), ".bw"), format="bw")
+	}
+}
+
+# WA = 0.917*G1 + 0.75*S1 + 0.583*S2 + 0.417*S3 + 0.25*S4
+WA <- list()
+for(rep_name in names(pndvs_good)){
+	pndv_good <- pndvs_good[[rep_name]]
+	G1 <- grep("_G1_", colnames(pndv_good), value=T)
+	S1 <- grep("_S1_", colnames(pndv_good), value=T)
+	S2 <- grep("_S2_", colnames(pndv_good), value=T)
+	S3 <- grep("_S3_", colnames(pndv_good), value=T)
+	S4 <- grep("_S4_", colnames(pndv_good), value=T)
+	WA[[rep_name]] <- 0.917*pndv_good[,G1] + 0.75*pndv_good[,S1] + 0.583*pndv_good[,S2] + 0.417*pndv_good[,S3] + 0.25*pndv_good[,S4]
+}
+
+for(x in names(WA)){
+	wa <- blocksR[idx]
+	score(wa) <- WA[[x]][idx]
+	export(wa, paste0(outpath, x, ".bw"), format="bw")
+}
+
+#--- quantile normalisation of RT WA ----
+
+## import WA files
+path="..."
+tmp <- list.files(path)
+tmp <- tmp[grep("HCT116_A|HCT116_B", tmp)]
+tmp <- paste0(path, tmp)
+
+path="..."
+tmp2 <- list.files(path)
+tmp2 <- tmp2[grep("DKO1_A|DKO1_B", tmp2)]
+tmp2 <- paste0(path, tmp2)
+
+tmp <- c(tmp, tmp2)
+
+hap.wa <- list()
+for (i in tmp) {
+ x <- import(i)
+ seqlevels(x, force=TRUE) <- seqlevels(Hsapiens)[1:23]
+ seqlengths(x) <- seqlengths(Hsapiens)[1:23]
+ hap.wa[[i]] <- x
+}
+names(hap.wa) <- gsub(".bw", "", basename(tmp))
+
+## define 1kb bins shared by all samples
+tmp <- Reduce(subsetByOverlaps, hap.wa)
+
+hap.wa.df <- matrix(nrow=length(tmp), ncol=length(hap.wa))
+for(i in 1:length(hap.wa)){
+  x <- subsetByOverlaps(hap.wa[[i]], tmp)
+  hap.wa.df[,i] <- x$score
+  cat(i)
+}
+colnames(hap.wa.df) <- names(hap.wa)
+mcols(tmp) <- data.frame(hap.wa.df)
+hap.wa.gr <- tmp
+
+## quantile normalise WA data
+library(preprocessCore)
+matrix <- as.matrix(hap.wa.df)
+hap.wa.df.norm <- normalize.quantiles(matrix)
+colnames(hap.wa.df.norm) <- paste0(names(hap.wa), ".norm")
+values(hap.wa.gr) <- c(values(hap.wa.gr), as.data.frame(hap.wa.df.norm))
+
+hap.wa.gr$dko.hap1.wa.avg.norm <- (hap.wa.gr$DKO1_A_hap1.norm + hap.wa.gr$DKO1_B_hap1.norm)/2
+hap.wa.gr$dko.hap2.wa.avg.norm <- (hap.wa.gr$DKO1_A_hap2.norm + hap.wa.gr$DKO1_B_hap2.norm)/2
+hap.wa.gr$hct.hap1.wa.avg.norm <- (hap.wa.gr$HCT116_A_hap1.norm + hap.wa.gr$HCT116_B_hap1.norm)/2
+hap.wa.gr$hct.hap2.wa.avg.norm <- (hap.wa.gr$HCT116_A_hap2.norm + hap.wa.gr$HCT116_B_hap2.norm)/2
+
+save(hap.wa.gr, file=".../hap.wa.gr.RData")
+
+#--- calling allelically replicating regions ----
+load(".../hap.wa.gr.RData")
+
+df <- as.data.frame(values(hap.wa.gr)[c(9:12)]) #HCT116 haplotype Repli-Seq
+tmp <- combn(colnames(df), 2, function(x) df[[x[1]]] - df[[x[2]]])
+colnames(tmp) <- combn(colnames(df), 2, paste, collapse="_")
+diffs <- unvalue(hap.wa.gr)
+values(diffs) <- as.data.frame(tmp)
+
+tmp <- diffs[which(abs(values(diffs)[[2]]) < 10 & abs(values(diffs)[[5]]) < 10 & abs(values(diffs)[[1]]) > 30 & abs(values(diffs)[[6]]) > 30)]
+# between replicate differences are less than 10 and between haplotype differences are more than 30
+hct.10.30 <- reduce(tmp)
+
+```
+
+# calling SVs
+```{r}
+#---- Nanopore sniffles SVs ----
+# See bash script Nanopore_NGMLR_sniffles.sh
+
+# HCT
+vcf_tab <- readVcf("sniffles_HCT116_hg19.vcf", "hg19")
+
+# making granges
+gr <- GenomicRanges::rowRanges(vcf_tab)
+inf <- info(vcf_tab)
+values(gr) <- cbind(values(gr), inf)
+
+geno <- geno(vcf_tab)
+gr$GT <- geno$GT
+gr$DR <- geno$DR
+gr$DV <- geno$DV
+
+hct.gr <- gr
+seqlevels(hct.gr, force=TRUE) <- seqlevels(Hsapiens)[1:23]
+seqlengths(hct.gr) <- seqlengths(Hsapiens)[1:23]
+
+# DKO
+vcf_tab <- readVcf("sniffles_DKO1_hg19.vcf", "hg19")
+
+# making granges
+gr <- GenomicRanges::rowRanges(vcf_tab)
+inf <- info(vcf_tab)
+values(gr) <- cbind(values(gr), inf)
+
+geno <- geno(vcf_tab)
+gr$GT <- geno$GT
+gr$DR <- geno$DR
+gr$DV <- geno$DV
+
+dko.gr <- gr
+seqlevels(dko.gr, force=TRUE) <- seqlevels(Hsapiens)[1:23]
+seqlengths(dko.gr) <- seqlengths(Hsapiens)[1:23]
+
+# filtering
+grh <- hct.gr[which(hct.gr$FILTER == "PASS")] 
+grh <- grh[which(grh$SVLEN >= 50)]
+values(grh) <- values(grh)[c(6,7,9,11,13,14,16,21,22,23,25)] 
+grh <- unique(grh)
+grh <- grh[which(as.numeric(grh$AF) > 0.3)]
+end(grh) <- grh$END
+
+grd <- dko.gr[which(dko.gr$FILTER == "PASS")]
+grd <- grd[which(grd$SVLEN >= 50)]
+values(grd) <- values(grd)[c(6,7,9,11,13,14,16,21,22,23,25)] 
+grd <- unique(grd)
+grd <- grd[which(as.numeric(grd$AF) > 0.3)]
+end(grd) <- grd$END
+
+ov <- findOverlaps(grh, grd)
+
+grh.ov <- grh[ov@queryHits]
+grd.ov <- grd[ov@subjectHits]
+
+grh.ov$width <- width(grh.ov)
+grd.ov$width <- width(grd.ov)
+
+width.ov <- c()
+for (i in 1:length(grh.ov)) {
+  width.ov[i] <- width(intersect(grh.ov[i], grd.ov[i]))
+  cat(i)
+}
+
+grh.ov$width.ov <- width.ov
+grd.ov$width.ov <- width.ov
+
+grh.ov$width.cent <- grh.ov$width.ov/grh.ov$width
+grd.ov$width.cent <- grd.ov$width.ov/grd.ov$width
+
+grh.ov2 <- grh.ov[which(grh.ov$width.cent >= 0.5 & grd.ov$width.cent >= 0.5)]
+grd.ov2 <- grd.ov[which(grh.ov$width.cent >= 0.5 & grd.ov$width.cent >= 0.5)]
+
+grh.ov3 <- grh.ov2[which(grh.ov2$SVTYPE == grd.ov2$SVTYPE)]
+grd.ov3 <- grd.ov2[which(grd.ov2$SVTYPE == grh.ov2$SVTYPE)]
+
+grh.notov <- grh[!grh %in% unique(grh.ov3)]
+grd.notov <- grd[!grd %in% unique(grd.ov3)]
+
+grh.notov <- reduce(grh.notov)
+grd.notov <- reduce(grd.notov)
+
+all.notov <- reduce(c(grh.notov, grd.notov))
+all.notov.10kb <- all.notov[which(width(all.notov) >= 10000)]
+tmp <- unvalue(all.notov.10kb)
+export(tmp, "sniffles_SVs.bed")
+
+#--- scCNV 10X SVs ----
+
+tmp <- getBSgenome("hg19")
+bins <- tileGenome(seqlengths(tmp), tilewidth=20000, cut.last.tile.in.chrom = T)
+seqlevels(bins, force=TRUE) <- seqlevels(Hsapiens)[1:23]
+seqlengths(bins) <- seqlengths(Hsapiens)[1:23]
+
+cnv <- data.frame(fread(".../HCT116/node_unmerged_cnv_calls.bed"), stringsAsFactors = F)
+cnv <- split(cnv, cnv$id)
+
+x <- cnv[["132"]] #group '132' is all cells together
+gr <- GRanges(paste0("chr", x$X.chrom), IRanges(x$start+1, x$end), strand="*", x[,c(4:6)])
+ov <- findOverlaps(bins, gr, minoverlap = 10000)
+df <- as.data.frame(bins)
+df$id <- NaN
+df$id[ov@queryHits] <- gr$id[ov@subjectHits]
+df$copy_number <- NaN
+df$copy_number[ov@queryHits] <- gr$copy_number[ov@subjectHits]
+df$event_confidence <- NaN
+df$event_confidence[ov@queryHits] <- gr$event_confidence[ov@subjectHits]
+table(rowSums(is.na(df[,c(6:8)])))
+df2 <- df[which(rowSums(is.na(df[,c(6:8)])) != 3),] 
+dfh <- df2
+
+cnv <- data.frame(fread(".../DKO1/node_unmerged_cnv_calls.bed"), stringsAsFactors = F)
+cnv <- split(cnv, cnv$id)
+
+x <- tmp2[["166"]] #group '166' is all cells together
+gr <- GRanges(paste0("chr", x$X.chrom), IRanges(x$start+1, x$end), strand="*", x[,c(4:6)])
+ov <- findOverlaps(bins, gr)
+df <- as.data.frame(bins)
+df$id <- NaN
+df$id[ov@queryHits] <- gr$id[ov@subjectHits]
+df$copy_number <- NaN
+df$copy_number[ov@queryHits] <- gr$copy_number[ov@subjectHits]
+df$event_confidence <- NaN
+df$event_confidence[ov@queryHits] <- gr$event_confidence[ov@subjectHits]
+table(rowSums(is.na(df[,c(6:8)])))
+df2 <- df[which(rowSums(is.na(df[,c(6:8)])) != 3),] 
+dfd <- df2
+
+dfh$bin <- paste0(dfh$seqnames, "_", dfh$start)
+dfd$bin <- paste0(dfd$seqnames, "_", dfd$start)
+df <- merge(dfh[,c(1,2,3,7:9)], dfd[,c(1,7:9)], by="bin", sort=F, suffixes=c(".h", ".d"))
+head(df)
+df$diff <- df$copy_number.d - df$copy_number.h
+
+df2 <- df[which(df$copy_number.h != df$copy_number.d),]
+df2 <- df2[which(df2$event_confidence.h > 4 & df2$event_confidence.d > 4),]
+tmp <- GRanges(df2$seqnames.h, IRanges(df2$start, df2$end))
+seqlevels(tmp, force=TRUE) <- seqlevels(Hsapiens)[1:23]
+seqlengths(tmp) <- seqlengths(Hsapiens)[1:23]
+tmp <- reduce(tmp)
+export(tmp, "scCNV_SVs.bed")
+
+#--- combining SVs ----
+# Nanopore
+all.notov.10kb <- import("sniffles_SVs.bed")
+
+# 10X scCNV
+scsv <- import("scCNV_SVs.bed")
+
+SV <- reduce(c(all.notov.10kb, scsv))
+export(SV, "SV_nanoscCNVtog.bed")
+```
+
+# chromHMM analysis
+```{r}
+#See https://github.com/qianxidu/Replication-Timing/blob/master/R_code_used_in_Du_et_al_Data_Analysis.Rmd#L578
+```
