@@ -582,3 +582,75 @@ export(SV, "SV_nanoscCNVtog.bed")
 ```{r}
 #See https://github.com/qianxidu/Replication-Timing/blob/master/R_code_used_in_Du_et_al_Data_Analysis.Rmd#L578
 ```
+
+# Hi-C saddle plots and compartment scores
+```{r}
+#--- Figure 4A - saddle plot ----
+
+load("saddle_out.RData") 
+# saddle_out from GENOVA
+
+head(saddle_out$saddle)
+dat <- saddle_out$saddle
+dat2 <- dat[which(dat$mean > 0),]
+
+tmp = setNames(aggregate(log2(dat2$mean), by = list(dat2$q1, dat2$q2, dat2$exp), mean, na.rm = T), c("x",'y','z', "score"))
+tmp$score[which(tmp$score < -1)] <- -1
+tmp$score[which(tmp$score > 1)] <- 1
+
+comp <- tmp[tmp$x != tmp$y,]
+colnames(comp) <- c("y", "x", "z", "score")
+comp <- comp[,c("x", "y", "z", "score")]
+
+df <- rbind(tmp, comp)
+df$z <- factor(df$z, levels=c("HCT", "DKO"))
+
+gg <- ggplot(df, aes(x, y, fill = score)) + geom_tile() + scale_x_reverse() +
+  scale_fill_gradientn(colours=rev(c("#B2182B", "white", "#2166AC")), limits=c(-1, 1)) + theme_minimal() + 
+  theme(axis.text.x = element_text(angle=90, vjust = 1, hjust = 1), panel.grid = element_blank()) + ggtitle("saddle") +
+  coord_fixed() + labs(x="bin1", y="bin2") + facet_wrap(~z)
+gg
+
+#--- Figure 4B ----
+
+load("saddle_out.RData")
+# saddle_out from GENOVA
+
+# script from GENOVA compartment strength function
+dat = saddle_out$saddle
+dat <- dat[!is.na(dat$q1),]
+
+namesVector <- c()
+namesVector <- c(namesVector, unique(dat$exp))
+dat$CC <- 'XX'
+MAXbin = max(dat$q1)
+binsTOse = floor(MAXbin * .2)
+binsTOse = max(1, binsTOse)
+#dat$MAT$unLog = 2 ** dat$MAT$value #values are already unlog-ed
+dat[dat$q1 <= binsTOse & dat$q2 <= binsTOse,"CC"] = "BB"
+dat[dat$q2 <= binsTOse & dat$q1 >= MAXbin-binsTOse+1,"CC"] = "AB"
+dat[dat$q1 <= binsTOse & dat$q2 >= MAXbin-binsTOse+1,"CC"] = "BA"
+dat[dat$q1 >= MAXbin-binsTOse+1 & dat$q2 >= MAXbin-binsTOse+1,"CC"] = "AA"
+dat = dat[dat$CC != 'XX',]
+dat2 <- dat[which(dat$mean > 0),]
+
+cescores = dplyr::summarise(dplyr::group_by(dat2,
+                                       exp,
+                                       CC),score = mean(log2(mean)))
+## values of cescores are plotted in 4B
+
+#--- Figure 4C ----
+
+tmp = dplyr::summarise(dplyr::group_by(dat2, chr,
+                                       exp,
+                                       CC),score = mean(mean))
+df.tmp <- as.data.frame(tmp)
+df.tmp <- dcast(df.tmp, exp + chr ~ CC)
+df.tmp$compscore <- log((df.tmp$AA*df.tmp$BB)/(df.tmp$BA^2))
+
+df.tmp$exp <- factor(df.tmp$exp, levels=c("HCT", "DKO"))
+
+df.hd <- dplyr::summarise(dplyr::group_by(df.tmp[is.finite(df.tmp$compscore),], exp), score = mean(compscore))
+## values of df.hd are plotted in 4B
+
+```
